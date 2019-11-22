@@ -1,0 +1,182 @@
+#include "vex.h"
+
+namespace drive {
+  vex::motor l1{vex::PORT20, vex::ratio18_1, false};
+  vex::motor l2{vex::PORT19, vex::ratio18_1, false};
+  vex::motor r1{vex::PORT18, vex::ratio18_1, true};
+  vex::motor r2{vex::PORT17, vex::ratio18_1, true};
+  vex::encoder lEnc{Brain.ThreeWirePort.A};
+  vex::encoder rEnc{Brain.ThreeWirePort.C};
+
+  double totalX=0, totalY=0;
+  double totalTheta=0;
+
+  void reset() {
+    l1.stop();
+    l2.stop();
+    r1.stop();
+    r2.stop();
+    l1.setBrake(vex::coast);
+    l2.setBrake(vex::coast);
+    r1.setBrake(vex::coast);
+    r2.setBrake(vex::coast);
+    l1.resetRotation();
+    l2.resetRotation();
+    r1.resetRotation();
+    r2.resetRotation();
+    lEnc.resetRotation();
+    rEnc.resetRotation();
+  }
+
+  int tracker() {
+    /*
+    sL/sR: Distance from left/right wheel to tracking center
+    dL/dR: Change left/right wheel distance in inches since last update
+    lastL/lastR: Last updated left/right wheel distance in inches
+    dTheta: Change in robot angle in _____ since last update
+    totalTheta: Absolute robot angle in _____
+    dDist: Change in distance in inches since last update or 'r' in polar coordinates
+    avgTheta: Angle used for polar coordinates
+    totalX/totalY: Absolute rectangular coordinates for robot
+    */
+    double sL = 1, sR = 1; //Temporary
+    double lastL=0, lastR=0;
+    double dL=0, dR=0;
+    double dTheta=0;
+    double dDist=0;
+    double avgTheta=0;
+    double dX=0, dY=0;
+
+    while(1) {
+
+      //Convert encoder ticks since last update into distance in inches
+      dL = (lEnc.rotation(vex::degrees) - lastL) / 360.0 * (M_PI * 2.75);
+      dR = (rEnc.rotation(vex::degrees) - lastR) / 360.0 * (M_PI * 2.75);
+
+      //Set left rotation to last updated ticks
+      lastL = lEnc.rotation(vex::degrees);
+      lastR = rEnc.rotation(vex::degrees);
+      
+      //Calculate change in robot angle since last update
+      dTheta = (lastL - lastR) / (sL + sR) - totalTheta;
+
+      totalTheta = (lastL - lastR) / (sL + sR);
+
+      //Calcualte distance robot has traveled (length of arc and 'r' for polar coordinates)
+      if(totalTheta == 0) {
+        dDist = dR;
+      }
+      else {
+        dDist = 2 * sin(dTheta / 2.0) * (dR / dTheta + sR);
+      }
+
+      //Calculate angle robot for translational shift (theta for polar coordinates)
+      avgTheta = totalTheta + (dTheta / 2.0);
+
+      //Convert from polar coordinates to rectangular coordinates for changes in x and y
+      dX = dDist * cos(avgTheta);
+      dY = dDist * sin(avgTheta);
+
+      //Add change in x and y to absolute rectangular coordinates
+      totalX += dX;
+      totalY += dY;
+
+      vex::wait(5, vex::msec);
+    }
+    return 1;
+  }
+
+  //Calculate distance from current point to target point
+  double distanceToPoint(double targetX, double targetY) {
+    double x = totalX, y = totalY;
+    return fabs(sqrt((targetX - x) + (targetY - y)));
+  }
+
+  //Calculate angle from current point to target point
+  double angleToPoint(double targetX, double targetY) {
+    double x = totalX, y = totalY;
+    return atan2(targetX - x, targetY - y);
+  }
+
+  //P-controller (maybe add ID) for distance error
+  double getDistVel(double error, double max, double accel) {
+    double kP = 0.5; //Temporary
+    double vel = error * kP;
+    if(vel > max) vel = max;
+    if(vel < -max) vel = -max;
+    return vel;
+  }
+
+  //P-controller (maybe add ID) for angle error
+  double getAngleVel(double error, double max, double accel) {
+    double kP = 0.5; //Temporary
+    double vel = error * kP;
+    if(vel > max) vel = max;
+    if(vel < -max) vel = -max;
+    return vel;
+  }
+
+  //Use Calculated velocities move chassis
+  void moveChassis(double distVel, double angleVel) {
+    double leftVel = distVel + angleVel;
+    double rightVel = distVel - angleVel;
+
+    //I don't understand this part
+    double maxVel = std::max(fabs(leftVel), fabs(rightVel));
+
+    if(maxVel > 100) {
+      leftVel /= maxVel;
+      rightVel /= maxVel;
+    }
+
+    l1.spin(vex::forward, leftVel, vex::pct);
+    l2.spin(vex::forward, leftVel, vex::pct);
+    r1.spin(vex::forward, rightVel, vex::pct);
+    r2.spin(vex::forward, rightVel, vex::pct);
+  }
+
+  //Move from currnet point to target point
+  int move(double targetX, double targetY, double kDist, double kAngle) {
+
+    double angleError=0, distError=0;
+    double settleRadius=5;
+
+    while(1) {
+      
+      //Get distance and angle error
+      distError = distanceToPoint(targetX, targetY);
+      angleError = angleToPoint(targetX, targetY);
+
+      //If the angle is behind the robot, add 90 degrees to drive backwards
+      if(fabs(angleError) > 90.0)
+        distError = -distError;
+
+      //I don't understand this part
+      if(distError < settleRadius)
+        angleError = 0;
+      else
+        angleError += 90.0;
+
+      //Calculate distance and angle velocities
+      double angleVel = getAngleVel(angleError, 100, 0);
+      double distVel = getDistVel(distError, 100, 0);
+
+      //Scale and move motors with given velocities
+      moveChassis(distVel * kDist, angleVel * kAngle);
+    }
+  }
+
+  int op() {
+    while(1) {
+      double leftY = con.Axis3.position();
+      double rightY = con.Axis2.position();
+
+      l1.spin(vex::forward, leftY, vex::pct);
+      l2.spin(vex::forward, leftY, vex::pct);
+      r1.spin(vex::forward, rightY, vex::pct);
+      r2.spin(vex::forward, rightY, vex::pct);
+
+      vex::wait(5, vex::msec);
+    }
+  }
+}
